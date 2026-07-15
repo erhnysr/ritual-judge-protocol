@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/relayer.ts",
+    "check-executors": "tsx src/check-executors.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

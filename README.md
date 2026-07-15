@@ -76,8 +76,13 @@ cd relayer
 cp .env.example .env   # fill in keys + AI_JUDGE_PANEL_ADDRESS
 npm install
 npm run typecheck
+npm run check-executors   # how many Ritual LLM executors are live right now
 npm start
 ```
+
+`check-executors` reports the registered Ritual executors and their endpoint
+health, so you can tell whether a genuine 3-executor consensus run is possible,
+only a degraded `ALLOW_EXECUTOR_REUSE` run, or none yet.
 
 ## Contracts: build, test, deploy
 
