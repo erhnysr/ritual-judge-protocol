@@ -22,6 +22,7 @@ import "dotenv/config";
 import {
   Contract,
   JsonRpcProvider,
+  Network,
   Wallet,
   keccak256,
   toUtf8Bytes,
@@ -89,9 +90,22 @@ const HERMES_RITUAL_LLM_ADDRESS = getAddress(reqEnv("HERMES_RITUAL_LLM_ADDRESS")
 const IPFS_GATEWAY = process.env.IPFS_GATEWAY ?? "https://ipfs.io/ipfs/";
 
 // ── Providers / signers ───────────────────────────────────────────────────────
-const arc = new JsonRpcProvider(ARC_RPC_URL);
+const ARC_CHAIN_ID = 5042002;
+const RITUAL_CHAIN_ID = 1979;
+
+// `staticNetwork` pins the chain id so ethers NEVER calls `eth_chainId` — that
+// handshake call is what was 429-ing on boot against the single shared public
+// Arc RPC. A wider `pollingInterval` also cuts the event-poll request rate.
+function makeProvider(url: string, chainId: number): JsonRpcProvider {
+  const network = Network.from(chainId);
+  const provider = new JsonRpcProvider(url, network, { staticNetwork: network });
+  provider.pollingInterval = 8000;
+  return provider;
+}
+
+const arc = makeProvider(ARC_RPC_URL, ARC_CHAIN_ID);
 const arcSigner = new Wallet(ARC_PRIVATE_KEY, arc);
-const ritual = new JsonRpcProvider(RITUAL_RPC_URL);
+const ritual = makeProvider(RITUAL_RPC_URL, RITUAL_CHAIN_ID);
 const ritualSigner = new Wallet(RITUAL_PRIVATE_KEY, ritual);
 
 const factory = new Contract(ARENA_FACTORY_ADDRESS, ARENA_FACTORY_ABI, arc);
@@ -99,6 +113,43 @@ const panel = new Contract(AI_JUDGE_PANEL_ADDRESS, PANEL_ABI, arcSigner);
 const hermes = new Contract(HERMES_RITUAL_LLM_ADDRESS, HERMES_ABI, ritualSigner);
 const registry = new Contract(TEE_SERVICE_REGISTRY, REGISTRY_ABI, ritual);
 const ritualWallet = new Contract(RITUAL_WALLET, WALLET_ABI, ritualSigner);
+
+// ── Retry / backoff ───────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Transient RPC failures worth retrying (rate limits, timeouts, dropped conns).
+const RETRYABLE =
+  /429|request limit|rate limit|too many requests|timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|SERVER_ERROR|bad response|could not coalesce|failed to detect network/i;
+
+/**
+ * Retry a network READ with exponential backoff. Only wrap idempotent reads /
+ * connectivity checks — never a tx send (a retried `ask()` would run and pay for
+ * a second inference). Non-retryable errors propagate immediately.
+ */
+async function withRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  attempts = 8
+): Promise<T> {
+  let delay = 1000;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = (err as Error).message ?? String(err);
+      if (i === attempts || !RETRYABLE.test(msg)) throw err;
+      console.warn(
+        `… ${label} failed (attempt ${i}/${attempts}): ${msg.slice(0, 100)} — retrying in ${delay}ms`
+      );
+      await sleep(delay);
+      delay = Math.min(delay * 2, 30000);
+    }
+  }
+  throw new Error("unreachable");
+}
 
 // ── Content resolution ────────────────────────────────────────────────────────
 
@@ -134,7 +185,9 @@ async function discoverExecutors(): Promise<string[]> {
     return distinct.slice(0, EXECUTORS_PER_JUDGEMENT);
   }
 
-  const services: any[] = await registry.getServicesByCapability(CAPABILITY_LLM, true);
+  const services: any[] = await withRetry("registry.getServicesByCapability", () =>
+    registry.getServicesByCapability(CAPABILITY_LLM, true)
+  );
   const distinct = [
     ...new Set(
       services.filter((s) => s.isValid).map((s) => getAddress(s.node.teeAddress))
@@ -170,7 +223,9 @@ function parseScore(reply: string): number {
 
 /** Ensure the Ritual signer has fee balance for the async LLM escrow. */
 async function ensureRitualFees(): Promise<void> {
-  const bal: bigint = await ritualWallet.balanceOf(ritualSigner.address);
+  const bal: bigint = await withRetry("ritualWallet.balanceOf", () =>
+    ritualWallet.balanceOf(ritualSigner.address)
+  );
   const floor = 400_000_000_000_000_000n; // 0.4 RITUAL
   if (bal < floor) {
     const topUp = 500_000_000_000_000_000n; // 0.5 RITUAL
@@ -190,8 +245,10 @@ async function judgeOnce(
 
   // Short-running async settles into the same tx, so the result is already
   // persisted. The latest inference id is inferenceCount - 1.
-  const count: bigint = await hermes.inferenceCount();
-  const inf = await hermes.inferences(count - 1n);
+  const count: bigint = await withRetry("hermes.inferenceCount", () =>
+    hermes.inferenceCount()
+  );
+  const inf = await withRetry("hermes.inferences", () => hermes.inferences(count - 1n));
   if (inf.hasError) {
     throw new Error(`executor ${executor} inference error: ${inf.errorMessage}`);
   }
@@ -212,14 +269,16 @@ async function judgeSubmission(
   inFlight.add(key);
   try {
     // Idempotency: skip if a request already exists for this submission.
-    const [, , existing] = await panel.scoreOf(arenaAddr, submissionId);
+    const [, , existing] = await withRetry("panel.scoreOf", () =>
+      panel.scoreOf(arenaAddr, submissionId)
+    );
     if (existing !== 0n) {
       console.log(`↷ ${key} already has request #${existing}, skipping`);
       return;
     }
 
     const arena = new Contract(arenaAddr, ARENA_ABI, arc);
-    const topic: string = await arena.topic();
+    const topic: string = await withRetry("arena.topic", () => arena.topic());
     const criteria =
       `Judge this entry for the contest topic: "${topic}". ` +
       `Reward relevance, quality, originality and wit.`;
@@ -287,9 +346,11 @@ async function watchArena(arenaAddr: string, fromBlock: number): Promise<void> {
   const arena = new Contract(norm, ARENA_ABI, arc);
 
   // Backfill existing submissions, then subscribe to new ones.
-  const current = await arc.getBlockNumber();
+  const current = await withRetry("arc.getBlockNumber", () => arc.getBlockNumber());
   const start = Math.max(0, fromBlock);
-  const past = await arena.queryFilter(arena.filters.SubmissionCreated(), start, current);
+  const past = await withRetry("arena.queryFilter", () =>
+    arena.queryFilter(arena.filters.SubmissionCreated(), start, current)
+  );
   for (const ev of past as EventLog[]) {
     const [id, , contentRef] = ev.args;
     await judgeSubmission(norm, id, contentRef);
@@ -310,8 +371,14 @@ async function main(): Promise<void> {
   console.log(`Panel:   ${AI_JUDGE_PANEL_ADDRESS}`);
   console.log(`Factory: ${ARENA_FACTORY_ADDRESS}\n`);
 
+  // Boot connectivity check (retries past the public RPC's rate limit).
+  const block = await withRetry("boot: arc.getBlockNumber", () => arc.getBlockNumber());
+  console.log(`Connected to Arc at block ${block}.\n`);
+
   // Existing arenas
-  const arenas: string[] = await factory.getArenas();
+  const arenas: string[] = await withRetry("factory.getArenas", () =>
+    factory.getArenas()
+  );
   for (const a of arenas) await watchArena(a, START_BLOCK);
 
   // New arenas as they are created
