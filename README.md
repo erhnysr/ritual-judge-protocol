@@ -98,7 +98,7 @@ RELAYER_ADDRESS=0x... forge script script/DeployAIJudgePanel.s.sol \
 | HermesRitualLLM | Ritual testnet (1979) | [`0x076d193E55C526ae709c529EA952847eB3eb2441`](https://explorer.ritualfoundation.org/address/0x076d193E55C526ae709c529EA952847eB3eb2441) |
 | TEEServiceRegistry | Ritual testnet (1979) | `0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F` |
 | Coliseum ArenaFactory | Arc testnet (5042002) | `0x13a38e7C2bA5AFA76a1AC21Eaef9f4DEA293FEBe` |
-| AIJudgePanel | Arc testnet (5042002) | _deploy with the script above_ |
+| AIJudgePanel | Arc testnet (5042002) | [`0x36aAD394561b6b63c447b651F084116B7dA708d4`](https://testnet.arcscan.app/address/0x36aAD394561b6b63c447b651F084116B7dA708d4) |
 
 ### First two integrations
 
