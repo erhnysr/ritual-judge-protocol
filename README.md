@@ -82,7 +82,13 @@ npm start
 
 `check-executors` reports the registered Ritual executors and their endpoint
 health, so you can tell whether a genuine 3-executor consensus run is possible,
-only a degraded `ALLOW_EXECUTOR_REUSE` run, or none yet.
+only a degraded `ALLOW_EXECUTOR_REUSE` run, or none yet. Add `--watch` (optional
+`--interval=<sec>`, default 30) to poll continuously and get a bell + banner the
+moment ≥3 distinct executors become available:
+
+```bash
+npm run check-executors -- --watch --interval=30
+```
 
 ## Contracts: build, test, deploy
 

@@ -37,7 +37,82 @@ async function probe(endpoint: string): Promise<string> {
   }
 }
 
+type Readiness = "ready" | "degraded" | "none";
+
+interface Snapshot {
+  total: number;
+  valid: number;
+  distinctCount: number;
+  executors: { addr: string; endpoint: string; health: string }[];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function readiness(distinctCount: number): Readiness {
+  if (distinctCount >= EXECUTORS_PER_JUDGEMENT) return "ready";
+  if (distinctCount >= 1) return "degraded";
+  return "none";
+}
+
+async function snapshot(registry: Contract): Promise<Snapshot> {
+  const services: any[] = await registry.getServicesByCapability(CAPABILITY_LLM, true);
+  const valid = services.filter((s) => s.isValid);
+  const distinct = [...new Set(valid.map((s) => getAddress(s.node.teeAddress)))];
+  const executors: Snapshot["executors"] = [];
+  for (const s of valid) {
+    const endpoint: string = s.node.endpoint;
+    executors.push({
+      addr: getAddress(s.node.teeAddress),
+      endpoint,
+      health: await probe(endpoint),
+    });
+  }
+  return {
+    total: services.length,
+    valid: valid.length,
+    distinctCount: distinct.length,
+    executors,
+  };
+}
+
+function printSummary(distinctCount: number): void {
+  const r = readiness(distinctCount);
+  if (r === "ready") {
+    console.log(
+      `✓ ${distinctCount} distinct executors — genuine ${EXECUTORS_PER_JUDGEMENT}-executor consensus is possible.`
+    );
+  } else if (r === "degraded") {
+    console.log(
+      `⚠ Only ${distinctCount} distinct executor(s) — real consensus needs ` +
+        `${EXECUTORS_PER_JUDGEMENT}. A degraded run is possible with ALLOW_EXECUTOR_REUSE=true ` +
+        `(reachable endpoints don't guarantee inference actually succeeds).`
+    );
+  } else {
+    console.log("✗ No valid LLM executors registered right now — judging can't run yet.");
+  }
+}
+
+function printFull(s: Snapshot): void {
+  console.log(
+    `Reported services: ${s.total} | valid: ${s.valid} | distinct executors: ${s.distinctCount}\n`
+  );
+  for (const e of s.executors) {
+    console.log(`• ${e.addr}`);
+    console.log(`    endpoint: ${e.endpoint || "(none)"}`);
+    console.log(`    health:   ${e.health}\n`);
+  }
+  console.log("── Summary ──");
+  printSummary(s.distinctCount);
+}
+
 async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const watch = args.includes("--watch");
+  const intervalArg = args.find((a) => a.startsWith("--interval="));
+  const intervalSec = Math.max(5, intervalArg ? Number(intervalArg.split("=")[1]) : 30);
+
   const network = Network.from(RITUAL_CHAIN_ID);
   const provider = new JsonRpcProvider(RITUAL_RPC_URL, network, {
     staticNetwork: network,
@@ -47,36 +122,38 @@ async function main(): Promise<void> {
   console.log(`Ritual RPC:      ${RITUAL_RPC_URL}`);
   console.log(`TEEServiceRegistry: ${TEE_SERVICE_REGISTRY}\n`);
 
-  const services: any[] = await registry.getServicesByCapability(CAPABILITY_LLM, true);
-  const valid = services.filter((s) => s.isValid);
-  const distinct = [...new Set(valid.map((s) => getAddress(s.node.teeAddress)))];
-
-  console.log(
-    `Reported services: ${services.length} | valid: ${valid.length} | distinct executors: ${distinct.length}\n`
-  );
-
-  for (const s of valid) {
-    const addr = getAddress(s.node.teeAddress);
-    const endpoint: string = s.node.endpoint;
-    const health = await probe(endpoint);
-    console.log(`• ${addr}`);
-    console.log(`    endpoint: ${endpoint || "(none)"}`);
-    console.log(`    health:   ${health}\n`);
+  if (!watch) {
+    printFull(await snapshot(registry));
+    return;
   }
 
-  console.log("── Summary ──");
-  if (distinct.length >= EXECUTORS_PER_JUDGEMENT) {
-    console.log(
-      `✓ ${distinct.length} distinct executors — genuine ${EXECUTORS_PER_JUDGEMENT}-executor consensus is possible.`
-    );
-  } else if (distinct.length >= 1) {
-    console.log(
-      `⚠ Only ${distinct.length} distinct executor(s) — real consensus needs ` +
-        `${EXECUTORS_PER_JUDGEMENT}. A degraded run is possible with ALLOW_EXECUTOR_REUSE=true ` +
-        `(reachable endpoints don't guarantee inference actually succeeds).`
-    );
-  } else {
-    console.log("✗ No valid LLM executors registered right now — judging can't run yet.");
+  console.log(`Watching every ${intervalSec}s. Ctrl-C to stop.\n`);
+  let prev: Readiness | null = null;
+  for (;;) {
+    const ts = new Date().toISOString().slice(11, 19);
+    try {
+      const s = await snapshot(registry);
+      const r = readiness(s.distinctCount);
+      const reachable = s.executors.filter((e) => e.health.startsWith("reachable")).length;
+      const mark = r === "ready" ? "✓" : r === "degraded" ? "⚠" : "✗";
+      console.log(
+        `[${ts}] ${mark} valid=${s.valid} distinct=${s.distinctCount} reachable=${reachable}/${s.executors.length} [${r}]`
+      );
+      if (r !== prev) {
+        if (r === "ready") {
+          // terminal bell + banner on the transition that unblocks the loop
+          console.log(
+            `\x07\n🎉 ${EXECUTORS_PER_JUDGEMENT}+ distinct executors available — run \`npm start\` to close the loop.\n`
+          );
+        } else if (prev !== null) {
+          console.log(`   (status changed: ${prev} → ${r})`);
+        }
+        prev = r;
+      }
+    } catch (err) {
+      console.log(`[${ts}] ! query failed: ${(err as Error).message.slice(0, 80)}`);
+    }
+    await sleep(intervalSec * 1000);
   }
 }
 
