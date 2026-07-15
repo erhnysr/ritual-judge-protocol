@@ -88,6 +88,11 @@ const RITUAL_RPC_URL = reqEnv("RITUAL_RPC_URL");
 const RITUAL_PRIVATE_KEY = reqEnv("RITUAL_PRIVATE_KEY");
 const HERMES_RITUAL_LLM_ADDRESS = getAddress(reqEnv("HERMES_RITUAL_LLM_ADDRESS"));
 const IPFS_GATEWAY = process.env.IPFS_GATEWAY ?? "https://ipfs.io/ipfs/";
+// Degraded fallback: cycle available executors when < EXECUTORS_PER_JUDGEMENT are
+// registered on Ritual. Off by default (strict distinct-executor consensus).
+const ALLOW_EXECUTOR_REUSE = /^(1|true|yes)$/i.test(
+  process.env.ALLOW_EXECUTOR_REUSE ?? ""
+);
 
 // ── Providers / signers ───────────────────────────────────────────────────────
 const ARC_CHAIN_ID = 5042002;
@@ -188,36 +193,53 @@ async function resolveContent(contentRef: string): Promise<string> {
 
 // ── Ritual: three-executor median inference ───────────────────────────────────
 
-/** Discover >= EXECUTORS_PER_JUDGEMENT distinct, valid LLM executors. */
+/**
+ * Discover the executor panel: EXECUTORS_PER_JUDGEMENT distinct, valid LLM
+ * executors (from EXECUTOR_ADDRESSES override or the TEEServiceRegistry).
+ *
+ * If fewer than that many are currently registered/valid — a real Ritual testnet
+ * liveness condition — and ALLOW_EXECUTOR_REUSE is set, the available executor(s)
+ * are cycled to fill the panel so the plumbing still runs. This is a DEGRADED
+ * mode (not genuine multi-model consensus) and is off by default.
+ */
 async function discoverExecutors(): Promise<string[]> {
+  let distinct: string[];
   const override = process.env.EXECUTOR_ADDRESSES;
   if (override && override.trim().length > 0) {
-    const addrs = override.split(",").map((a) => getAddress(a.trim()));
-    const distinct = [...new Set(addrs)];
-    if (distinct.length < EXECUTORS_PER_JUDGEMENT) {
-      throw new Error(
-        `EXECUTOR_ADDRESSES needs >= ${EXECUTORS_PER_JUDGEMENT} distinct addresses`
-      );
-    }
+    distinct = [...new Set(override.split(",").map((a) => getAddress(a.trim())))];
+  } else {
+    const services: any[] = await withRetry("registry.getServicesByCapability", () =>
+      registry.getServicesByCapability(CAPABILITY_LLM, true)
+    );
+    distinct = [
+      ...new Set(
+        services.filter((s) => s.isValid).map((s) => getAddress(s.node.teeAddress))
+      ),
+    ];
+  }
+
+  if (distinct.length >= EXECUTORS_PER_JUDGEMENT) {
     return distinct.slice(0, EXECUTORS_PER_JUDGEMENT);
   }
 
-  const services: any[] = await withRetry("registry.getServicesByCapability", () =>
-    registry.getServicesByCapability(CAPABILITY_LLM, true)
-  );
-  const distinct = [
-    ...new Set(
-      services.filter((s) => s.isValid).map((s) => getAddress(s.node.teeAddress))
-    ),
-  ];
-  if (distinct.length < EXECUTORS_PER_JUDGEMENT) {
-    throw new Error(
-      `Only ${distinct.length} valid LLM executor(s) registered; the median ` +
-        `consensus needs ${EXECUTORS_PER_JUDGEMENT} distinct ones. Set ` +
-        `EXECUTOR_ADDRESSES or retry later.`
+  if (ALLOW_EXECUTOR_REUSE && distinct.length >= 1) {
+    console.warn(
+      `⚠ DEGRADED: only ${distinct.length} valid executor(s) available; cycling ` +
+        `to fill ${EXECUTORS_PER_JUDGEMENT} (ALLOW_EXECUTOR_REUSE). This is NOT ` +
+        `true multi-model consensus.`
+    );
+    return Array.from(
+      { length: EXECUTORS_PER_JUDGEMENT },
+      (_, i) => distinct[i % distinct.length]
     );
   }
-  return distinct.slice(0, EXECUTORS_PER_JUDGEMENT);
+
+  throw new Error(
+    `Only ${distinct.length} valid LLM executor(s) registered; the median ` +
+      `consensus needs ${EXECUTORS_PER_JUDGEMENT} distinct ones. Set ` +
+      `ALLOW_EXECUTOR_REUSE=true to cycle the available one(s) for testing, ` +
+      `or EXECUTOR_ADDRESSES, or retry later.`
+  );
 }
 
 /** Build the scoring prompt. Model must answer with a single integer 0..100. */
