@@ -21,6 +21,7 @@
 import "dotenv/config";
 import {
   Contract,
+  Interface,
   JsonRpcProvider,
   Network,
   Wallet,
@@ -28,7 +29,6 @@ import {
   toUtf8Bytes,
   solidityPackedKeccak256,
   getAddress,
-  EventLog,
 } from "ethers";
 
 // ── Ritual system addresses (chain 1979), per hermes-ritual-bridge ──────────
@@ -120,26 +120,43 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Transient RPC failures worth retrying (rate limits, timeouts, dropped conns).
+// Flatten an error (incl. ethers' nested `.info` / `.error`) into one searchable
+// string so we can match the rate-limit code/message wherever it's buried.
+function errText(err: unknown): string {
+  const e = err as any;
+  const parts = [
+    e?.message,
+    e?.code,
+    e?.shortMessage,
+    e?.info ? JSON.stringify(e.info) : "",
+    e?.error ? JSON.stringify(e.error) : "",
+  ];
+  return parts.filter(Boolean).join(" ");
+}
+
+// Transient RPC failures worth retrying. Arc's public RPC returns JSON-RPC
+// code -32011 ("request limit reached") under load; ethers surfaces it as an
+// UNKNOWN_ERROR / "could not coalesce" wrapper, so match both the code and text.
 const RETRYABLE =
-  /429|request limit|rate limit|too many requests|timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|SERVER_ERROR|bad response|could not coalesce|failed to detect network/i;
+  /-32011|429|request limit|rate limit|limit reached|too many requests|timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|SERVER_ERROR|UNKNOWN_ERROR|bad response|could not coalesce|failed to detect network/i;
 
 /**
- * Retry a network READ with exponential backoff. Only wrap idempotent reads /
- * connectivity checks — never a tx send (a retried `ask()` would run and pay for
- * a second inference). Non-retryable errors propagate immediately.
+ * Retry a network READ with exponential backoff (2s → 30s cap, 8 attempts).
+ * Only wrap idempotent reads / getLogs / connectivity checks — never a tx send
+ * (a retried `ask()` would run and pay for a second inference). Non-retryable
+ * errors propagate immediately.
  */
 async function withRetry<T>(
   label: string,
   fn: () => Promise<T>,
   attempts = 8
 ): Promise<T> {
-  let delay = 1000;
+  let delay = 2000;
   for (let i = 1; i <= attempts; i++) {
     try {
       return await fn();
     } catch (err) {
-      const msg = (err as Error).message ?? String(err);
+      const msg = errText(err);
       if (i === attempts || !RETRYABLE.test(msg)) throw err;
       console.warn(
         `… ${label} failed (attempt ${i}/${attempts}): ${msg.slice(0, 100)} — retrying in ${delay}ms`
@@ -257,25 +274,48 @@ async function judgeOnce(
 
 // ── Core: judge one submission end-to-end ─────────────────────────────────────
 
-const inFlight = new Set<string>();
+/**
+ * Send a GUARDED, idempotent tx with retry. Only safe for `openRequest` /
+ * `submitScores`: the panel reverts (`AlreadyRequested` / `NotAwaitingJudgement`)
+ * on a true double, which we treat as "already applied" success. NEVER use this
+ * for `ask()` — a retried inference would run and pay twice.
+ */
+async function sendGuarded(
+  label: string,
+  send: () => Promise<any>,
+  alreadyDone: RegExp
+): Promise<void> {
+  await withRetry(label, async () => {
+    try {
+      const tx = await send();
+      await tx.wait();
+    } catch (err) {
+      if (alreadyDone.test(errText(err))) {
+        console.log(`   ${label}: already applied on-chain, continuing`);
+        return;
+      }
+      throw err;
+    }
+  });
+}
 
+/**
+ * Judge one submission. Resumable and idempotent: safe to call repeatedly for
+ * the same submission across poll ticks. Returns true once the submission is
+ * judged on-chain (so the caller can drop it from the pending queue), false if
+ * this attempt failed and should be retried.
+ */
 async function judgeSubmission(
   arenaAddr: string,
   submissionId: bigint,
   contentRef: string
-): Promise<void> {
+): Promise<boolean> {
   const key = `${arenaAddr.toLowerCase()}:${submissionId}`;
-  if (inFlight.has(key)) return;
-  inFlight.add(key);
   try {
-    // Idempotency: skip if a request already exists for this submission.
-    const [, , existing] = await withRetry("panel.scoreOf", () =>
+    const [judged, , existing] = await withRetry("panel.scoreOf", () =>
       panel.scoreOf(arenaAddr, submissionId)
     );
-    if (existing !== 0n) {
-      console.log(`↷ ${key} already has request #${existing}, skipping`);
-      return;
-    }
+    if (judged) return true; // nothing to do
 
     const arena = new Contract(arenaAddr, ARENA_ABI, arc);
     const topic: string = await withRetry("arena.topic", () => arena.topic());
@@ -286,23 +326,26 @@ async function judgeSubmission(
     const content = await resolveContent(contentRef);
     const contentHash = keccak256(toUtf8Bytes(content));
 
-    // 1) open the request on-chain (emits IAIJudgeRequest.AIJudgeRequested)
-    const openTx = await panel.openRequest(
-      arenaAddr,
-      submissionId,
-      contentHash,
-      contentRef,
-      criteria
-    );
-    const openReceipt = await openTx.wait();
-    const requestId: bigint = await panel.requestIdOf(
-      solidityPackedKeccak256(["address", "uint256"], [arenaAddr, submissionId])
-    );
-    console.log(
-      `▶ opened request #${requestId} for ${key} (open tx ${openReceipt.hash})`
-    );
+    // 1) open the request (or resume an already-open, unjudged one)
+    let requestId = existing;
+    if (requestId === 0n) {
+      await sendGuarded(
+        "openRequest",
+        () => panel.openRequest(arenaAddr, submissionId, contentHash, contentRef, criteria),
+        /AlreadyRequested/
+      );
+      requestId = await withRetry("panel.requestIdOf", () =>
+        panel.requestIdOf(
+          solidityPackedKeccak256(["address", "uint256"], [arenaAddr, submissionId])
+        )
+      );
+      console.log(`▶ opened request #${requestId} for ${key}`);
+    } else {
+      console.log(`↻ resuming unjudged request #${requestId} for ${key}`);
+    }
 
-    // 2) three-executor inference on Ritual
+    // 2) three-executor inference on Ritual. `ask()` is NOT retried (non-
+    //    idempotent); if it fails, we return false and re-run on the next tick.
     await ensureRitualFees();
     const executors = await discoverExecutors();
     const prompt = buildPrompt(criteria, content);
@@ -317,53 +360,129 @@ async function judgeSubmission(
     }
 
     // 3) write back; panel computes the median on-chain
-    const submitTx = await panel.submitScores(
-      requestId,
-      scores as [number, number, number],
-      ritualTxHashes as [string, string, string]
+    await sendGuarded(
+      "submitScores",
+      () =>
+        panel.submitScores(
+          requestId,
+          scores as [number, number, number],
+          ritualTxHashes as [string, string, string]
+        ),
+      /NotAwaitingJudgement/
     );
-    await submitTx.wait();
-    const [, median] = await panel.scoreOf(arenaAddr, submissionId);
+    const [, median] = await withRetry("panel.scoreOf", () =>
+      panel.scoreOf(arenaAddr, submissionId)
+    );
     console.log(
       `✓ request #${requestId} judged: scores [${scores.join(", ")}] median ${median}`
     );
+    return true;
   } catch (err) {
-    console.error(`✗ ${key} failed:`, (err as Error).message);
-    inFlight.delete(key); // allow a retry on the next sighting
-    return;
+    console.error(`✗ ${key} failed: ${errText(err).slice(0, 160)}`);
+    return false; // keep it queued; retried on the next tick
   }
 }
 
-// ── Watching Coliseum ─────────────────────────────────────────────────────────
+// ── Watching Coliseum (single-poll, rate-limit friendly) ──────────────────────
+//
+// We deliberately do NOT use ethers `contract.on(...)` subscriptions: each one
+// starts its own background `eth_getLogs` poller that is outside `withRetry`, so
+// under Arc's public-RPC rate limiting they emit an unhandled provider `error`
+// event and crash the process. Instead we run one owned loop that:
+//   - batches ALL known arenas into a SINGLE eth_getLogs per tick (address array),
+//     so request volume is constant regardless of arena count, and
+//   - wraps every getLogs / getBlockNumber in withRetry.
 
-const watchedArenas = new Set<string>();
+const POLL_INTERVAL_MS = 8000;
 
-async function watchArena(arenaAddr: string, fromBlock: number): Promise<void> {
-  const norm = getAddress(arenaAddr);
-  if (watchedArenas.has(norm)) return;
-  watchedArenas.add(norm);
+const arenaIface = new Interface(ARENA_ABI);
+const factoryIface = new Interface(ARENA_FACTORY_ABI);
+const SUBMISSION_TOPIC = arenaIface.getEvent("SubmissionCreated")!.topicHash;
+const ARENA_CREATED_TOPIC = factoryIface.getEvent("ArenaCreated")!.topicHash;
 
-  const arena = new Contract(norm, ARENA_ABI, arc);
+interface PendingSub {
+  arena: string;
+  id: bigint;
+  contentRef: string;
+}
 
-  // Backfill existing submissions, then subscribe to new ones.
-  const current = await withRetry("arc.getBlockNumber", () => arc.getBlockNumber());
-  const start = Math.max(0, fromBlock);
-  const past = await withRetry("arena.queryFilter", () =>
-    arena.queryFilter(arena.filters.SubmissionCreated(), start, current)
-  );
-  for (const ev of past as EventLog[]) {
-    const [id, , contentRef] = ev.args;
-    await judgeSubmission(norm, id, contentRef);
-  }
+async function watchLoop(): Promise<void> {
+  const knownArenas = new Set<string>(); // checksummed addresses
+  // Discovered-but-not-yet-judged submissions. Discovery advances `fromBlock`
+  // once, but judging is retried from here every tick until it lands on-chain,
+  // so a submission is never lost to a transient failure.
+  const pending = new Map<string, PendingSub>();
 
-  arena.on(
-    arena.filters.SubmissionCreated(),
-    (id: bigint, _submitter: string, contentRef: string) => {
-      console.log(`● SubmissionCreated arena=${norm} id=${id}`);
-      void judgeSubmission(norm, id, contentRef);
+  // Seed with arenas that already exist.
+  const seed: string[] = await withRetry("factory.getArenas", () => factory.getArenas());
+  for (const a of seed) knownArenas.add(getAddress(a));
+  console.log(`Seeded ${knownArenas.size} existing arena(s).`);
+
+  // Never scan a giant historical range in one getLogs. If START_BLOCK is 0
+  // (unset), start from the current head instead of block 0.
+  const head = await withRetry("boot: arc.getBlockNumber", () => arc.getBlockNumber());
+  let fromBlock = START_BLOCK > 0 ? START_BLOCK : head;
+  console.log(`Watching from block ${fromBlock}. Ctrl-C to stop.\n`);
+
+  for (;;) {
+    // ── Discovery: advance fromBlock, enqueue any new submissions ──
+    try {
+      const current = await withRetry("arc.getBlockNumber", () => arc.getBlockNumber());
+      if (current >= fromBlock) {
+        // 1) new arenas created since last tick
+        const createdLogs = await withRetry("getLogs:ArenaCreated", () =>
+          arc.getLogs({
+            address: ARENA_FACTORY_ADDRESS,
+            topics: [ARENA_CREATED_TOPIC],
+            fromBlock,
+            toBlock: current,
+          })
+        );
+        for (const log of createdLogs) {
+          const addr = getAddress(factoryIface.parseLog(log)!.args.arena as string);
+          if (!knownArenas.has(addr)) {
+            knownArenas.add(addr);
+            console.log(`● ArenaCreated ${addr}`);
+          }
+        }
+
+        // 2) one getLogs for SubmissionCreated across ALL known arenas
+        if (knownArenas.size > 0) {
+          const subLogs = await withRetry("getLogs:SubmissionCreated", () =>
+            arc.getLogs({
+              address: [...knownArenas],
+              topics: [SUBMISSION_TOPIC],
+              fromBlock,
+              toBlock: current,
+            })
+          );
+          for (const log of subLogs) {
+            const parsed = arenaIface.parseLog(log)!;
+            const arena = getAddress(log.address);
+            const id = parsed.args.id as bigint;
+            const k = `${arena.toLowerCase()}:${id}`;
+            if (!pending.has(k)) {
+              pending.set(k, { arena, id, contentRef: parsed.args.contentRef as string });
+              console.log(`● SubmissionCreated arena=${arena} id=${id}`);
+            }
+          }
+        }
+
+        fromBlock = current + 1;
+      }
+    } catch (err) {
+      // Discovery failed this tick; fromBlock not advanced, so nothing skipped.
+      console.error(`watch tick (discovery) failed: ${errText(err).slice(0, 160)}`);
     }
-  );
-  console.log(`👁  watching arena ${norm}`);
+
+    // ── Judging: drain the pending queue; keep failures for the next tick ──
+    for (const [k, sub] of [...pending]) {
+      const done = await judgeSubmission(sub.arena, sub.id, sub.contentRef);
+      if (done) pending.delete(k);
+    }
+
+    await sleep(POLL_INTERVAL_MS);
+  }
 }
 
 async function main(): Promise<void> {
@@ -371,23 +490,15 @@ async function main(): Promise<void> {
   console.log(`Panel:   ${AI_JUDGE_PANEL_ADDRESS}`);
   console.log(`Factory: ${ARENA_FACTORY_ADDRESS}\n`);
 
-  // Boot connectivity check (retries past the public RPC's rate limit).
+  // Safety net: swallow stray provider errors so a transient background failure
+  // can never crash the process via an unhandled 'error' event.
+  arc.on("error", (e) => console.warn(`arc provider: ${errText(e).slice(0, 100)}`));
+  ritual.on("error", (e) => console.warn(`ritual provider: ${errText(e).slice(0, 100)}`));
+
   const block = await withRetry("boot: arc.getBlockNumber", () => arc.getBlockNumber());
   console.log(`Connected to Arc at block ${block}.\n`);
 
-  // Existing arenas
-  const arenas: string[] = await withRetry("factory.getArenas", () =>
-    factory.getArenas()
-  );
-  for (const a of arenas) await watchArena(a, START_BLOCK);
-
-  // New arenas as they are created
-  factory.on(factory.filters.ArenaCreated(), (arenaAddr: string) => {
-    console.log(`● ArenaCreated ${arenaAddr}`);
-    void watchArena(arenaAddr, START_BLOCK);
-  });
-
-  console.log("\nRelayer running. Ctrl-C to stop.");
+  await watchLoop();
 }
 
 main().catch((err) => {
