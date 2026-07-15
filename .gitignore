@@ -1,0 +1,15 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node (relayer)
+node_modules/
+relayer/node_modules/
+relayer/dist/
+*.log

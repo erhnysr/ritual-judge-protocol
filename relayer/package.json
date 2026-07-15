@@ -1,0 +1,19 @@
+{
+  "name": "ritual-judge-relayer",
+  "version": "0.1.0",
+  "description": "Off-chain relayer: watches Coliseum SubmissionCreated on Arc, runs 3-executor median AI judging on Ritual, writes results back to AIJudgePanel on Arc.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/relayer.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}
