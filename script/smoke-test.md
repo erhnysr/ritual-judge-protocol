@@ -44,14 +44,14 @@ NOW=$(date +%s)
 cast send 0x13a38e7C2bA5AFA76a1AC21Eaef9f4DEA293FEBe \
   "createArena(string,uint256,uint256,uint256)" \
   "AI judge smoke test" 0 $((NOW+3600)) $((NOW+7200)) \
-  --account deployer --rpc-url https://rpc.testnet.arc.network
+  --account deployer --rpc-url https://rpc.testnet.arc.io
 ```
 
 ### 2. Read back the new arena address (last entry)
 
 ```bash
 cast call 0x13a38e7C2bA5AFA76a1AC21Eaef9f4DEA293FEBe \
-  "getArenas()(address[])" --rpc-url https://rpc.testnet.arc.network
+  "getArenas()(address[])" --rpc-url https://rpc.testnet.arc.io
 
 ARENA=<paste_last_address>
 ```
@@ -61,7 +61,7 @@ ARENA=<paste_last_address>
 ```bash
 cast send 0x3600000000000000000000000000000000000000 \
   "approve(address,uint256)" $ARENA 100000 \
-  --account deployer --rpc-url https://rpc.testnet.arc.network
+  --account deployer --rpc-url https://rpc.testnet.arc.io
 ```
 
 ### 4. Submit one real entry (inline content the AI scores)
@@ -69,7 +69,7 @@ cast send 0x3600000000000000000000000000000000000000 \
 ```bash
 cast send $ARENA "submit(string)" \
   "Arc makes five-cent votes viable: USDC as native gas, sub-cent fees, instant finality. Coliseum turns that into a judging market where both the crowd and a TEE-verified AI panel score every entry." \
-  --account deployer --rpc-url https://rpc.testnet.arc.network
+  --account deployer --rpc-url https://rpc.testnet.arc.io
 ```
 
 Emits `SubmissionCreated(0, deployer, contentRef)`.
@@ -95,7 +95,7 @@ Expected log sequence:
 
 ```bash
 PANEL=0x36aAD394561b6b63c447b651F084116B7dA708d4
-ARC=https://rpc.testnet.arc.network
+ARC=https://rpc.testnet.arc.io
 
 # median score + judged flag for the submission
 cast call $PANEL "scoreOf(address,uint256)(bool,uint256,uint256)" $ARENA 0 --rpc-url $ARC
